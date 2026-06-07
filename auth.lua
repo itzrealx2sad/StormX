@@ -5,7 +5,7 @@
 
 local Auth = {
     LOADED = true,
-    VERSION = "1.3.0",
+    VERSION = "1.3.1",
     DISCORD_TIMEOUT = 600,
 }
 
@@ -766,13 +766,13 @@ function Client:wait_for_discord_link(timeout)
     timeout = timeout or Auth.DISCORD_TIMEOUT
     local deadline = os.clock() + timeout
     while os.clock() < deadline do
-        local info = self:discord_info()
+        local info = Client.discord_info(self)
         if info.linked then
             return info
         end
         task.wait(2)
     end
-    return self:discord_info()
+    return Client.discord_info(self)
 end
 
 function Client:close()
@@ -818,22 +818,37 @@ function Auth:authenticate(timeout)
     self._client:link_discord()
     local info = self._client:wait_for_discord_link(timeout)
     if info.linked then
+        self._client.login_data.discord_linked = true
+        self._client.login_data.discord_id = info.discord_id
+        self._client.login_data.discord_username = info.discord_username
         Auth.log("Discord linked:", info.discord_username or info.discord_id or "ok")
     end
     return info.linked == true
 end
 
 function Auth:_discord_satisfied()
-    local data = self._client.login_data
+    local data = self._client.login_data or {}
     if data.discord_linked or data.discord_id then
         return true
     end
-    return (self._client:discord_info()).linked == true
+    local ok, info = pcall(function()
+        return Client.discord_info(self._client)
+    end)
+    return ok and info and info.linked == true
+end
+
+function Auth:discord_info()
+    local ok, info = pcall(function()
+        return Client.discord_info(self._client)
+    end)
+    if ok and type(info) == "table" then
+        return info
+    end
+    return self._client.login_data or {}
 end
 
 function Auth:user_info()
-    local login = self._client.login_data
-    local discord = self._client.authenticated and self._client:discord_info() or {}
+    local login = self._client.login_data or {}
     local device = self._client.device_info or {}
     return {
         user_id = login.user_id,
@@ -846,9 +861,9 @@ function Auth:user_info()
         roblox_user_id = self._client.roblox_user_id,
         roblox_username = device.username,
         client_type = CLIENT_TYPE,
-        discord_linked = discord.linked or login.discord_linked,
-        discord_id = discord.discord_id or login.discord_id,
-        discord_username = discord.discord_username or login.discord_username,
+        discord_linked = login.discord_linked == true or login.discord_id ~= nil,
+        discord_id = login.discord_id,
+        discord_username = login.discord_username,
         require_discord = login.require_discord ~= false,
         expires_at = login.expires_at,
     }
