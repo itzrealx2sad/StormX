@@ -271,7 +271,7 @@ local function pure_crypto_scalarmult(q, n, p)
     a[1] = 1
     d[1] = 1
     for i = 254, 0, -1 do
-        local r = bit32.band(bit32.rshift(z[bit32.rshift(i, 3)+1], i & 7), 1)
+        local r = bit32.band(bit32.rshift(z[bit32.rshift(i, 3)+1], bit32.band(i, 7)), 1)
         pure_sel25519(a, b, r)
         pure_sel25519(c, d, r)
         pure_A(e, a, c)
