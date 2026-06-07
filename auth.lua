@@ -374,10 +374,15 @@ end
 
 local function aes_gcm_encrypt(key, iv, aad, plaintext)
     local C = need_crypt()
-    if C.encrypt then
-        local ok, res = pcall(C.encrypt, "aes-256-gcm", plaintext, key, iv, aad)
+    local enc_fn = C.encrypt or C.aes_encrypt or C.aesencrypt
+    if enc_fn then
+        local ok, res = pcall(enc_fn, "aes-256-gcm", plaintext, key, iv, aad)
         if ok and res then
             return res
+        end
+        local ok2, res2 = pcall(enc_fn, plaintext, key, iv, aad)
+        if ok2 and res2 then
+            return res2
         end
     end
     if C.custom and C.custom.aes_gcm_encrypt then
@@ -388,10 +393,15 @@ end
 
 local function aes_gcm_decrypt(key, iv, aad, ciphertext)
     local C = need_crypt()
-    if C.decrypt then
-        local ok, res = pcall(C.decrypt, "aes-256-gcm", ciphertext, key, iv, aad)
+    local dec_fn = C.decrypt or C.aes_decrypt or C.aesdecrypt
+    if dec_fn then
+        local ok, res = pcall(dec_fn, "aes-256-gcm", ciphertext, key, iv, aad)
         if ok and res then
             return res
+        end
+        local ok2, res2 = pcall(dec_fn, ciphertext, key, iv, aad)
+        if ok2 and res2 then
+            return res2
         end
     end
     if C.custom and C.custom.aes_gcm_decrypt then
