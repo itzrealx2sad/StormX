@@ -798,8 +798,19 @@ function Auth.new(server, license_key)
         license_key = license_key,
         product = product,
         _client = Client.new(product.version_id, server, product.sign_pub_key, product.seal_pub_key),
+        _keepalive_running = false,
     }
     return setmetatable(self, { __index = Auth })
+end
+
+function Auth:_finalize_session()
+    if self:heartbeat() then
+        Auth.log("Heartbeat OK")
+        Auth.log("Session active")
+        return true
+    end
+    Auth.log("Heartbeat failed")
+    return false
 end
 
 function Auth:authenticate(timeout)
@@ -812,7 +823,7 @@ function Auth:authenticate(timeout)
     end
     if self:_discord_satisfied() then
         Auth.log("Authenticated (Discord already linked)")
-        return true
+        return self:_finalize_session()
     end
     Auth.log("Discord link required — waiting for OAuth...")
     self._client:link_discord()
@@ -822,8 +833,9 @@ function Auth:authenticate(timeout)
         self._client.login_data.discord_id = info.discord_id
         self._client.login_data.discord_username = info.discord_username
         Auth.log("Discord linked:", info.discord_username or info.discord_id or "ok")
+        return self:_finalize_session()
     end
-    return info.linked == true
+    return false
 end
 
 function Auth:_discord_satisfied()
@@ -873,7 +885,27 @@ function Auth:heartbeat()
     return self._client:heartbeat()
 end
 
+function Auth:keepalive(interval)
+    interval = interval or 25
+    if self._keepalive_running then
+        return
+    end
+    self._keepalive_running = true
+    task.spawn(function()
+        while self._keepalive_running and self._client.session_id do
+            task.wait(interval)
+            if not self._keepalive_running then
+                break
+            end
+            pcall(function()
+                self:heartbeat()
+            end)
+        end
+    end)
+end
+
 function Auth:close()
+    self._keepalive_running = false
     self._client:close()
 end
 
@@ -897,6 +929,7 @@ function Auth.protect(callback, server, license_key, timeout)
         end)
         Auth.halt("authentication failed")
     end
+    auth:keepalive(25)
     local ok3, result = pcall(callback, auth)
     pcall(function()
         auth:close()
