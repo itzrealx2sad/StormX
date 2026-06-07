@@ -161,7 +161,7 @@ local function pure_car25519(o)
     local c
     for i = 1, 16 do
         o[i] = o[i] + 65536
-        c = o[i] // 65536
+        c = math.floor(o[i] / 65536)
         if i < 16 then
             o[i+1] = o[i+1] + (c - 1)
         else
