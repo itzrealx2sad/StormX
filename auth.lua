@@ -140,34 +140,236 @@ local function hkdf_derive(shared, client_nonce, server_nonce, version_id, sessi
     }
 end
 
+local function get_crypt()
+    local ok, res = pcall(function()
+        return crypt or (syn and syn.crypt) or (fluxus and fluxus.crypt) or (Sentinel and Sentinel.crypt) or _G.crypt
+    end)
+    return ok and res or nil
+end
+
 local function need_crypt()
-    if typeof(crypt) ~= "table" then
+    local C = get_crypt()
+    if not C then
         Auth.halt("executor crypt library required for StormX crypto")
     end
-    return crypt
+    return C
+end
+
+-- ////////// Pure Luau Curve25519 (X25519) Fallback //////////
+
+local function pure_car25519(o)
+    local c
+    for i = 1, 16 do
+        o[i] = o[i] + 65536
+        c = o[i] // 65536
+        if i < 16 then
+            o[i+1] = o[i+1] + (c - 1)
+        else
+            o[1] = o[1] + 38 * (c - 1)
+        end
+        o[i] = o[i] - bit32.lshift(c, 16)
+    end
+end
+
+local function pure_sel25519(p, q, b)
+    local c = bit32.bnot(b - 1)
+    local t
+    for i = 1, 16 do
+        t = bit32.band(c, bit32.bxor(p[i], q[i]))
+        p[i] = bit32.bxor(p[i], t)
+        q[i] = bit32.bxor(q[i], t)
+    end
+end
+
+local function pure_pack25519(o, n)
+    local m, t = {}, {}
+    local b
+    for i = 1, 16 do t[i] = n[i] end
+    pure_car25519(t)
+    pure_car25519(t)
+    pure_car25519(t)
+    for _ = 1, 2 do
+        m[1] = t[1] - 0xffed
+        for i = 2, 15 do
+            m[i] = t[i] - 0xffff - bit32.band(bit32.rshift(m[i-1], 16), 1)
+            m[i-1] = bit32.band(m[i-1], 0xffff)
+        end
+        m[16] = t[16] - 0x7fff - bit32.band(bit32.rshift(m[15], 16), 1)
+        b = bit32.band(bit32.rshift(m[16], 16), 1)
+        m[15] = bit32.band(m[15], 0xffff)
+        pure_sel25519(t, m, 1-b)
+    end
+    for i = 1, 16 do
+        o[2*i-1] = bit32.band(t[i], 0xff)
+        o[2*i] = bit32.rshift(t[i], 8)
+    end
+end
+
+local function pure_unpack25519(o, n)
+    for i = 1, 16 do
+        o[i] = n[2*i-1] + bit32.lshift(n[2*i], 8)
+    end
+    o[16] = bit32.band(o[16], 0x7fff)
+end
+
+local function pure_A(o, a, b)
+    for i = 1, 16 do o[i] = a[i] + b[i] end
+end
+
+local function pure_Z(o, a, b)
+    for i = 1, 16 do o[i] = a[i] - b[i] end
+end
+
+local function pure_M(o, a, b)
+    local t = table.create(32, 0)
+    for i = 1, 16 do
+        for j = 1, 16 do
+            t[i+j-1] = t[i+j-1] + (a[i] * b[j])
+        end
+    end
+    for i = 1, 15 do t[i] = t[i] + 38 * t[i+16] end
+    for i = 1, 16 do o[i] = t[i] end
+    pure_car25519(o)
+    pure_car25519(o)
+end
+
+local function pure_S(o, a)
+    pure_M(o, a, a)
+end
+
+local function pure_inv25519(o, i)
+    local c = {}
+    for a = 1, 16 do c[a] = i[a] end
+    for a = 253, 0, -1 do
+        pure_S(c, c)
+        if a ~= 2 and a ~= 4 then pure_M(c, c, i) end
+    end
+    for a = 1, 16 do o[a] = c[a] end
+end
+
+local pure_t_121665 = {0xDB41,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+
+local function pure_crypto_scalarmult(q, n, p)
+    local z = {}
+    local x = {}
+    local a = table.create(16, 0)
+    local b = table.create(16, 0)
+    local c = table.create(16, 0)
+    local d = table.create(16, 0)
+    local e = table.create(16, 0)
+    local f = table.create(16, 0)
+    for i = 1, 31 do z[i] = n[i] end
+    z[32] = bit32.bor(bit32.band(n[32], 127), 64)
+    z[1] = bit32.band(z[1], 248)
+    pure_unpack25519(x, p)
+    for i = 1, 16 do
+        b[i] = x[i]
+        a[i] = 0
+        c[i] = 0
+        d[i] = 0
+    end
+    a[1] = 1
+    d[1] = 1
+    for i = 254, 0, -1 do
+        local r = bit32.band(bit32.rshift(z[bit32.rshift(i, 3)+1], i & 7), 1)
+        pure_sel25519(a, b, r)
+        pure_sel25519(c, d, r)
+        pure_A(e, a, c)
+        pure_Z(a, a, c)
+        pure_A(c, b, d)
+        pure_Z(b, b, d)
+        pure_S(d, e)
+        pure_S(f, a)
+        pure_M(a, c, a)
+        pure_M(c, b, e)
+        pure_A(e, a, c)
+        pure_Z(a, a, c)
+        pure_S(b, a)
+        pure_Z(c, d, f)
+        pure_M(a, c, pure_t_121665)
+        pure_A(a, a, d)
+        pure_M(c, c, a)
+        pure_M(a, d, f)
+        pure_M(d, b, x)
+        pure_S(b, e)
+        pure_sel25519(a, b, r)
+        pure_sel25519(c, d, r)
+    end
+    for i = 1, 16 do
+        x[i+16] = a[i]
+        x[i+32] = c[i]
+        x[i+48] = b[i]
+        x[i+64] = d[i]
+    end
+    local x16, x32 = {}, {}
+    for i = 1, 80 do
+        if i > 16 and i <= 32 then x16[i-16] = x[i] end
+        if i > 32 and i <= 48 then x32[i-32] = x[i] end
+    end
+    pure_inv25519(x32, x32)
+    pure_M(x16, x16, x32)
+    pure_pack25519(q, x16)
+    return 0
+end
+
+local function pure_x25519(scalar, point)
+    local qt, nt, pt = {}, {}, {}
+    for i = 1, 32 do
+        nt[i] = string.byte(scalar, i)
+        pt[i] = string.byte(point, i)
+    end
+    pure_crypto_scalarmult(qt, nt, pt)
+    local q = table.create(32)
+    for i = 1, 32 do
+        q[i] = string.char(qt[i])
+    end
+    return table.concat(q)
+end
+
+local function pure_x25519_base(scalar)
+    local base_point = string.char(9) .. string.rep(string.char(0), 31)
+    return pure_x25519(scalar, base_point)
 end
 
 local function x25519_keypair()
-    local C = need_crypt()
-    if C.generatekey and C.computekey then
-        local sk = C.generatekey()
-        return sk, C.computekey(sk)
+    local C = get_crypt()
+    if C then
+        local gen_fn = C.generatekey or C.generate_key or C.generatekeypair or C.generate_keypair
+        local comp_fn = C.computekey or C.compute_key
+        if gen_fn and comp_fn then
+            local ok, sk_or_pk, pk = pcall(gen_fn)
+            if ok and sk_or_pk and pk then
+                return sk_or_pk, pk
+            end
+            if ok and sk_or_pk then
+                local ok2, derived_pk = pcall(comp_fn, sk_or_pk)
+                if ok2 and derived_pk then
+                    return sk_or_pk, derived_pk
+                end
+            end
+        end
     end
-    if C.custom and C.custom.x25519_keypair then
-        return C.custom.x25519_keypair()
-    end
-    Auth.halt("crypt x25519 not available")
+
+    -- Pure Luau Fallback (when crypt is missing or x25519 is not supported)
+    local private_key = random_bytes(32)
+    local public_key = pure_x25519_base(private_key)
+    return private_key, public_key
 end
 
 local function x25519_shared(sk, pk)
-    local C = need_crypt()
-    if C.custom and C.custom.x25519_shared then
-        return C.custom.x25519_shared(sk, pk)
+    local C = get_crypt()
+    if C then
+        local comp_fn = C.computekey or C.compute_key or C.computeshared or C.compute_shared
+        if comp_fn then
+            local ok, shared = pcall(comp_fn, sk, pk)
+            if ok and shared then
+                return shared
+            end
+        end
     end
-    if C.computekey then
-        return C.computekey(sk, pk)
-    end
-    Auth.halt("crypt x25519 shared secret not available")
+
+    -- Pure Luau Fallback
+    return pure_x25519(sk, pk)
 end
 
 local function aes_gcm_encrypt(key, iv, aad, plaintext)
