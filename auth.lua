@@ -833,7 +833,7 @@ end
 
 function Auth:user_info()
     local login = self._client.login_data
-    local discord = self._client.authenticated and self:discord_info() or {}
+    local discord = self._client.authenticated and self._client:discord_info() or {}
     local device = self._client.device_info or {}
     return {
         user_id = login.user_id,
