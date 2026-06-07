@@ -5,9 +5,11 @@
 
 local Auth = {
     LOADED = true,
-    VERSION = "1.2.4",
+    VERSION = "1.3.0",
     DISCORD_TIMEOUT = 600,
 }
+
+local CLIENT_TYPE = "roblox lua"
 
 -- ////////// embedded crypto (pure Luau, no external requires) //////////
 
@@ -506,7 +508,18 @@ local function http_request(method, url, body, headers)
     return json_decode(res.Body)
 end
 
-local function collect_hwid()
+local function collect_roblox_info()
+    local user_id = 0
+    local username = ""
+    pcall(function()
+        local Players = game:GetService("Players")
+        local lp = Players.LocalPlayer
+        if lp then
+            user_id = lp.UserId
+            username = lp.Name
+        end
+    end)
+
     local client_id = "roblox"
     local exec_gethwid = gethwid or get_hwid or (_G and (_G.gethwid or _G.get_hwid))
     if typeof(exec_gethwid) == "function" then
@@ -525,16 +538,40 @@ local function collect_hwid()
     end
 
     local place_id = "0"
+    local job_id = ""
     pcall(function()
         place_id = tostring(game.PlaceId)
+        job_id = tostring(game.JobId)
     end)
-    local joined = table.concat({ "roblox", client_id, place_id }, "|")
+
+    local device_type = "unknown"
+    pcall(function()
+        local UserInputService = game:GetService("UserInputService")
+        device_type = tostring(UserInputService:GetPlatform())
+    end)
+
+    return {
+        roblox_user_id = tostring(user_id),
+        username = username:sub(1, 64),
+        place_id = place_id,
+        job_id = job_id:sub(1, 64),
+        client_id = client_id:sub(1, 128),
+        device_type = device_type,
+        client_type = CLIENT_TYPE,
+    }
+end
+
+local function collect_hwid(device_info)
+    local user_id = device_info.roblox_user_id or "0"
+    local client_id = device_info.client_id or "roblox"
+    local place_id = device_info.place_id or "0"
+    local joined = table.concat({ "roblox", user_id, client_id, place_id }, "|")
     return {
         cpu_signature = "roblox",
-        disk_serial = client_id:sub(1, 128),
+        disk_serial = user_id:sub(1, 128),
         mac_address = place_id:sub(1, 32),
-        board_serial = place_id:sub(1, 128),
-        system_uuid = client_id:sub(1, 128),
+        board_serial = client_id:sub(1, 128),
+        system_uuid = (device_info.username or ""):sub(1, 128),
         hwid_hash = hex_encode(sha256(joined)),
     }
 end
@@ -610,6 +647,8 @@ function Client.new(version_id, server, sign_pub_key, seal_pub_key)
         sign_pub_key = sign_pub_key,
         seal_pub_key = seal_pub_key,
         session_id = nil,
+        roblox_user_id = 0,
+        device_info = nil,
         keys = nil,
         ws = nil,
         authenticated = false,
@@ -624,34 +663,36 @@ function Client.new(version_id, server, sign_pub_key, seal_pub_key)
 end
 
 function Client:init()
+    self.device_info = collect_roblox_info()
+    self.roblox_user_id = tonumber(self.device_info.roblox_user_id) or 0
+    if self.roblox_user_id <= 0 then
+        Auth.halt("roblox user id required (wait for LocalPlayer)")
+    end
+    self.hwid_data = collect_hwid(self.device_info)
+
     local client_nonce = hex_encode(random_bytes(32))
-    local client_sk, client_eph_pub = x25519_keypair()
-    if #client_eph_pub ~= 32 then
-        Auth.halt("client ephemeral public key invalid (" .. #client_eph_pub .. " bytes)")
-    end
-    client_eph_pub = hex_encode(client_eph_pub)
-    if #client_eph_pub ~= 64 then
-        Auth.halt("client ephemeral public key hex invalid (" .. #client_eph_pub .. " chars)")
-    end
     local url = string.format(
-        "%s/stormx/auth/versions/%s/init",
+        "%s/stormx/auth/versions/%s/init/roblox",
         http_base(self.server),
         self.version_id
     )
     local body = http_request("POST", url, {
-        client_eph_pub = client_eph_pub,
+        client_type = CLIENT_TYPE,
+        roblox_user_id = self.roblox_user_id,
         client_nonce = client_nonce,
+        device_info = self.device_info,
     }, {})
-    local data = body.data
-    self.keys = perform_init_verify(
-        data,
-        client_eph_pub,
-        client_nonce,
-        client_sk,
-        self.version_id,
-        self.sign_pub_key
-    )
+    if body.success == false then
+        Auth.halt(body.message or "init failed")
+    end
+    local data = body.data or {}
     self.session_id = data.session_id
+    self.sign_pub_key = data.sign_pub_key or self.sign_pub_key
+    self.seal_pub_key = data.seal_pub_key or self.seal_pub_key
+    if not self.session_id then
+        Auth.halt("init failed: no session")
+    end
+    Auth.log("Session ready (user " .. tostring(self.roblox_user_id) .. ")")
     return data
 end
 
@@ -659,102 +700,30 @@ function Client:connect()
     if not self.session_id then
         self:init()
     end
-    -- Support passing session_id in query parameter for executors with limited header support
-    local ws_url = string.format(
-        "%s/stormx/auth/versions/%s/ws?session_id=%s",
-        ws_base(self.server),
-        self.version_id,
-        self.session_id
-    )
-
-    self._opened = false
-    self._inbox = nil
-
-    local executor_ws_connect = (WebSocket and WebSocket.connect) or (syn and syn.websocket and syn.websocket.connect)
-    if typeof(executor_ws_connect) == "function" then
-        local headers = { ["X-Session-ID"] = self.session_id }
-        local ok, ws = pcall(function()
-            return executor_ws_connect(ws_url, headers)
-        end)
-        if not ok or not ws then
-            ok, ws = pcall(executor_ws_connect, ws_url)
-        end
-        if not ok or not ws then
-            error("executor WebSocket connection failed: " .. tostring(ws))
-        end
-
-        self.ws = ws
-        self._opened = true -- Executor connections are synchronous upon return
-
-        local on_message = ws.OnMessage or ws.MessageReceived or ws.on_message
-        if on_message then
-            pcall(function()
-                on_message:Connect(function(msg)
-                    self._inbox = msg
-                end)
-            end)
-            pcall(function()
-                on_message:listen(function(msg)
-                    self._inbox = msg
-                end)
-            end)
-        end
-    else
-        self.ws = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
-            Url = ws_url,
-            Headers = { ["X-Session-ID"] = self.session_id },
-        })
-        self.ws.Opened:Connect(function()
-            self._opened = true
-        end)
-        self.ws.MessageReceived:Connect(function(msg)
-            self._inbox = msg
-        end)
-        self.ws.Error:Connect(function(err)
-            warn("[StormX] WebSocket error:", err)
-        end)
-
-        local deadline = os.clock() + 30
-        while not self._opened and os.clock() < deadline do
-            task.wait(0.05)
-        end
-        if not self._opened then
-            error("websocket connect timeout")
-        end
-    end
-end
-
-function Client:_send_recv(msg)
-    local aad = self.version_id .. ":" .. self.session_id
-    local frame = encrypt_frame(self.keys, json_encode(msg), aad, self.c2s_seq)
-    self.c2s_seq += 1
-    self._inbox = nil
-    self.ws:Send(frame)
-    local deadline = os.clock() + 30
-    while self._inbox == nil and os.clock() < deadline do
-        task.wait(0.02)
-    end
-    if not self._inbox then
-        error("websocket recv timeout")
-    end
-    local plain = decrypt_frame(self.keys, self._inbox, aad, self.s2c_seq, "s2c")
-    self.s2c_seq += 1
-    return json_decode(plain)
 end
 
 function Client:login(license_key)
-    if not self.ws then
-        self:connect()
+    if not self.session_id then
+        self:init()
     end
-    local hw = collect_hwid()
-    local sealed = seal_license_key(self.seal_pub_key, license_key)
-    local result = self:_send_recv({
-        type = 1,
-        data = { sealed_license_key = sealed, hwid = hw },
-    })
-    local data = result.data or {}
+    local url = string.format(
+        "%s/stormx/auth/versions/%s/login",
+        http_base(self.server),
+        self.version_id
+    )
+    local body = http_request("POST", url, {
+        session_id = self.session_id,
+        license_key = license_key,
+        client_type = CLIENT_TYPE,
+        roblox_user_id = self.roblox_user_id,
+        device_info = self.device_info,
+        hwid = self.hwid_data,
+    }, {})
+    if body.success == false then
+        error(body.message or "login request failed")
+    end
+    local data = body.data or {}
     self.login_data = data
-    self.hwid_data = hw
     self.authenticated = data.success == true
     if data.link_url then
         self.last_link_url = data.link_url
@@ -763,13 +732,27 @@ function Client:login(license_key)
 end
 
 function Client:heartbeat()
-    local result = self:_send_recv({ type = 2, data = {} })
-    return (result.data or {}).ok == true
+    local url = string.format(
+        "%s/stormx/auth/versions/%s/heartbeat",
+        http_base(self.server),
+        self.version_id
+    )
+    local body = http_request("POST", url, {
+        session_id = self.session_id,
+    }, {})
+    local data = body.data or {}
+    return data.ok == true
 end
 
 function Client:discord_info()
-    local result = self:_send_recv({ type = 3, data = {} })
-    return result.data or {}
+    local url = string.format(
+        "%s/stormx/auth/versions/%s/discord?session_id=%s",
+        http_base(self.server),
+        self.version_id,
+        self.session_id
+    )
+    local body = http_request("GET", url, nil, {})
+    return body.data or {}
 end
 
 function Client:link_discord()
@@ -820,12 +803,11 @@ function Auth.new(server, license_key)
 end
 
 function Auth:authenticate(timeout)
-    Auth.log("Initializing session...")
+    Auth.log("Initializing Roblox session...")
     self._client:init()
-    self._client:connect()
     Auth.log("Logging in...")
     if not self._client:login(self.license_key) then
-        Auth.log("Login failed")
+        Auth.log("Login failed:", self._client.login_data.message or "unknown")
         return false
     end
     if self:_discord_satisfied() then
@@ -852,6 +834,7 @@ end
 function Auth:user_info()
     local login = self._client.login_data
     local discord = self._client.authenticated and self:discord_info() or {}
+    local device = self._client.device_info or {}
     return {
         user_id = login.user_id,
         license_key_id = login.license_key_id,
@@ -860,6 +843,9 @@ function Auth:user_info()
         version_id = self.product.version_id,
         key_prefix = login.key_prefix,
         hwid_hash = login.hwid_hash or self._client.hwid_data.hwid_hash,
+        roblox_user_id = self._client.roblox_user_id,
+        roblox_username = device.username,
+        client_type = CLIENT_TYPE,
         discord_linked = discord.linked or login.discord_linked,
         discord_id = discord.discord_id or login.discord_id,
         discord_username = discord.discord_username or login.discord_username,
