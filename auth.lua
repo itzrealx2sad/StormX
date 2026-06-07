@@ -303,6 +303,10 @@ local function json_decode(s)
     return HttpService:JSONDecode(s)
 end
 
+function Auth.log(...)
+    print("[StormX]", ...)
+end
+
 function Auth.halt(reason)
     warn("[StormX] " .. tostring(reason or "blocked"))
     while true do
@@ -350,16 +354,45 @@ local function resolve_api_path(server_base, path)
     return server_base:gsub("/+$", "") .. path
 end
 
+local exec_request = (syn and syn.request) or (http and http.request) or request or http_request
+
 local function http_request(method, url, body, headers)
     headers = headers or {}
     if body then
         headers["Content-Type"] = "application/json"
     end
+    local payload = body and json_encode(body) or nil
+
+    if typeof(exec_request) == "function" and exec_request ~= http_request then
+        local ok, res = pcall(exec_request, {
+            Url = url,
+            Method = method,
+            Headers = headers,
+            Body = payload,
+        })
+        if ok and res then
+            local status = res.StatusCode or res.Status
+            local success = res.Success
+            if success == nil and status then
+                success = (status >= 200 and status < 300)
+            end
+            if success then
+                local resp_body = res.Body or ""
+                if resp_body == "" then
+                    return {}
+                end
+                return json_decode(resp_body)
+            else
+                error("HTTP " .. tostring(status or "failed") .. " " .. url)
+            end
+        end
+    end
+
     local res = HttpService:RequestAsync({
         Url = url,
         Method = method,
         Headers = headers,
-        Body = body and json_encode(body) or nil,
+        Body = payload,
     })
     if not res.Success then
         error("HTTP " .. tostring(res.StatusCode) .. " " .. url)
@@ -410,19 +443,16 @@ local function open_discord(http_base_url, link_path)
         error("no discord oauth url")
     end
     if plugin and plugin.OpenBrowserWindow then
+        Auth.log("Opening Discord link in browser...")
         plugin:OpenBrowserWindow(open_url)
         return open_url
     end
     if typeof(setclipboard) == "function" then
         setclipboard(open_url)
+        Auth.log("Discord URL copied to clipboard — open browser and complete login.")
+    else
+        Auth.log("Link Discord:", open_url)
     end
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "StormX — Link Discord",
-            Text = "URL copied. Open browser and complete Discord login.",
-            Duration = 12,
-        })
-    end)
     return open_url
 end
 
@@ -509,34 +539,68 @@ function Client:connect()
     if not self.session_id then
         self:init()
     end
+    -- Support passing session_id in query parameter for executors with limited header support
     local ws_url = string.format(
-        "%s/stormx/auth/versions/%s/ws",
+        "%s/stormx/auth/versions/%s/ws?session_id=%s",
         ws_base(self.server),
-        self.version_id
+        self.version_id,
+        self.session_id
     )
 
     self._opened = false
     self._inbox = nil
-    self.ws = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
-        Url = ws_url,
-        Headers = { ["X-Session-ID"] = self.session_id },
-    })
-    self.ws.Opened:Connect(function()
-        self._opened = true
-    end)
-    self.ws.MessageReceived:Connect(function(msg)
-        self._inbox = msg
-    end)
-    self.ws.Error:Connect(function(err)
-        warn("[StormX] WebSocket error:", err)
-    end)
 
-    local deadline = os.clock() + 30
-    while not self._opened and os.clock() < deadline do
-        task.wait(0.05)
-    end
-    if not self._opened then
-        error("websocket connect timeout")
+    local executor_ws_connect = (WebSocket and WebSocket.connect) or (syn and syn.websocket and syn.websocket.connect)
+    if typeof(executor_ws_connect) == "function" then
+        local headers = { ["X-Session-ID"] = self.session_id }
+        local ok, ws = pcall(function()
+            return executor_ws_connect(ws_url, headers)
+        end)
+        if not ok or not ws then
+            ok, ws = pcall(executor_ws_connect, ws_url)
+        end
+        if not ok or not ws then
+            error("executor WebSocket connection failed: " .. tostring(ws))
+        end
+
+        self.ws = ws
+        self._opened = true -- Executor connections are synchronous upon return
+
+        local on_message = ws.OnMessage or ws.MessageReceived or ws.on_message
+        if on_message then
+            pcall(function()
+                on_message:Connect(function(msg)
+                    self._inbox = msg
+                end)
+            end)
+            pcall(function()
+                on_message:listen(function(msg)
+                    self._inbox = msg
+                end)
+            end)
+        end
+    else
+        self.ws = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, {
+            Url = ws_url,
+            Headers = { ["X-Session-ID"] = self.session_id },
+        })
+        self.ws.Opened:Connect(function()
+            self._opened = true
+        end)
+        self.ws.MessageReceived:Connect(function(msg)
+            self._inbox = msg
+        end)
+        self.ws.Error:Connect(function(err)
+            warn("[StormX] WebSocket error:", err)
+        end)
+
+        local deadline = os.clock() + 30
+        while not self._opened and os.clock() < deadline do
+            task.wait(0.05)
+        end
+        if not self._opened then
+            error("websocket connect timeout")
+        end
     end
 end
 
@@ -636,16 +700,24 @@ function Auth.new(server, license_key)
 end
 
 function Auth:authenticate(timeout)
+    Auth.log("Initializing session...")
     self._client:init()
     self._client:connect()
+    Auth.log("Logging in...")
     if not self._client:login(self.license_key) then
+        Auth.log("Login failed")
         return false
     end
     if self:_discord_satisfied() then
+        Auth.log("Authenticated (Discord already linked)")
         return true
     end
+    Auth.log("Discord link required — waiting for OAuth...")
     self._client:link_discord()
     local info = self._client:wait_for_discord_link(timeout)
+    if info.linked then
+        Auth.log("Discord linked:", info.discord_username or info.discord_id or "ok")
+    end
     return info.linked == true
 end
 
@@ -689,6 +761,7 @@ function Auth.protect(callback, server, license_key, timeout)
     if not Auth.LOADED then
         Auth.halt("auth.lua not loaded")
     end
+    Auth.log("StormX Auth v" .. Auth.VERSION)
     local ok, auth_or_err = pcall(Auth.new, server, license_key)
     if not ok then
         Auth.halt("auth init failed: " .. tostring(auth_or_err))
