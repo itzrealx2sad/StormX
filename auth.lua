@@ -354,7 +354,7 @@ local function resolve_api_path(server_base, path)
     return server_base:gsub("/+$", "") .. path
 end
 
-local exec_request = (syn and syn.request) or (http and http.request) or request or http_request
+local exec_request = (syn and syn.request) or (http and http.request) or request or (_G and _G.http_request)
 
 local function http_request(method, url, body, headers)
     headers = headers or {}
@@ -405,11 +405,22 @@ end
 
 local function collect_hwid()
     local client_id = "roblox"
-    pcall(function()
-        if Analytics then
-            client_id = Analytics:GetClientId()
+    local exec_gethwid = gethwid or get_hwid or (_G and (_G.gethwid or _G.get_hwid))
+    if typeof(exec_gethwid) == "function" then
+        local ok, id = pcall(exec_gethwid)
+        if ok and type(id) == "string" and id ~= "" then
+            client_id = id
         end
-    end)
+    end
+
+    if client_id == "roblox" then
+        pcall(function()
+            if Analytics then
+                client_id = Analytics:GetClientId()
+            end
+        end)
+    end
+
     local place_id = "0"
     pcall(function()
         place_id = tostring(game.PlaceId)
