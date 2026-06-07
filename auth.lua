@@ -5,7 +5,7 @@
 
 local Auth = {
     LOADED = true,
-    VERSION = "1.3.1",
+    VERSION = "1.3.3",
     DISCORD_TIMEOUT = 600,
 }
 
@@ -724,24 +724,65 @@ function Client:login(license_key)
     end
     local data = body.data or {}
     self.login_data = data
-    self.authenticated = data.success == true
     if data.link_url then
         self.last_link_url = data.link_url
     end
-    return self.authenticated
+
+    local msg = tostring(data.message or "")
+    Auth.log("Login response:", msg ~= "" and msg or "(no message)", "| discord_linked:", tostring(data.discord_linked))
+
+    if data.success ~= true then
+        Auth.log("Login failed:", data.fail_reason or msg or "unknown")
+        self.authenticated = false
+        return false
+    end
+    if msg == "authentication failed" then
+        Auth.log("Login failed:", data.fail_reason or msg)
+        self.authenticated = false
+        return false
+    end
+    if msg == "discord_required" then
+        self.authenticated = false
+        return true
+    end
+    if msg == "authenticated" or data.discord_linked == true then
+        self.authenticated = true
+        return true
+    end
+    Auth.log("Login failed:", msg ~= "" and msg or "unknown")
+    self.authenticated = false
+    return false
 end
 
 function Client:heartbeat()
+    if not self.session_id then
+        Auth.log("Heartbeat skipped: no session")
+        return false
+    end
     local url = string.format(
         "%s/stormx/auth/versions/%s/heartbeat",
         http_base(self.server),
         self.version_id
     )
-    local body = http_request("POST", url, {
-        session_id = self.session_id,
-    }, {})
+    local ok, body = pcall(function()
+        return http_request("POST", url, {
+            session_id = self.session_id,
+        }, {})
+    end)
+    if not ok then
+        Auth.log("Heartbeat request failed:", tostring(body))
+        return false
+    end
+    if body.success == false then
+        Auth.log("Heartbeat error:", body.message or "unknown")
+        return false
+    end
     local data = body.data or {}
-    return data.ok == true
+    if data.ok ~= true then
+        Auth.log("Heartbeat rejected:", data.error or "unknown")
+        return false
+    end
+    return true
 end
 
 function Client:discord_info()
@@ -826,7 +867,18 @@ function Auth:authenticate(timeout)
         return self:_finalize_session()
     end
     Auth.log("Discord link required — waiting for OAuth...")
-    self._client:link_discord()
+    if not self._client.last_link_url then
+        Auth.log("Login failed: no discord link URL from server")
+        return false
+    end
+    local ok_link, link_err = pcall(function()
+        self._client:link_discord()
+    end)
+    if not ok_link then
+        Auth.log("Discord link error:", tostring(link_err))
+        Auth.log("Open this URL in your browser:", self._client.last_link_url)
+        return false
+    end
     local info = self._client:wait_for_discord_link(timeout)
     if info.linked then
         self._client.login_data.discord_linked = true
@@ -835,6 +887,7 @@ function Auth:authenticate(timeout)
         Auth.log("Discord linked:", info.discord_username or info.discord_id or "ok")
         return self:_finalize_session()
     end
+    Auth.log("Discord link not completed in time")
     return false
 end
 
@@ -897,9 +950,12 @@ function Auth:keepalive(interval)
             if not self._keepalive_running then
                 break
             end
-            pcall(function()
-                self:heartbeat()
+            local beat_ok, beat = pcall(function()
+                return self:heartbeat()
             end)
+            if beat_ok and not beat then
+                Auth.log("Keepalive heartbeat failed")
+            end
         end
     end)
 end
@@ -923,7 +979,13 @@ function Auth.protect(callback, server, license_key, timeout)
     local ok2, authed = pcall(function()
         return auth:authenticate(timeout)
     end)
-    if not ok2 or not authed then
+    if not ok2 then
+        pcall(function()
+            auth:close()
+        end)
+        Auth.halt("authenticate error: " .. tostring(authed))
+    end
+    if not authed then
         pcall(function()
             auth:close()
         end)
@@ -931,10 +993,10 @@ function Auth.protect(callback, server, license_key, timeout)
     end
     auth:keepalive(25)
     local ok3, result = pcall(callback, auth)
-    pcall(function()
-        auth:close()
-    end)
     if not ok3 then
+        pcall(function()
+            auth:close()
+        end)
         Auth.halt("script error: " .. tostring(result))
     end
     return result
